@@ -879,7 +879,10 @@ def init_db():
                 presence_time TEXT,
                 login_time TEXT,
                 reason TEXT,
-                timestamp TEXT
+                timestamp TEXT,
+                status TEXT DEFAULT 'pending',
+                approved_by TEXT,
+                approved_at TEXT
             )
         """)
 
@@ -1658,7 +1661,12 @@ def get_schedule_for_date(agent_id, date_ymd):
         conn.close()
 
 def create_swap_request(requester_id, target_id, date, reason, requester_date=None, target_date=None):
-    """Create a swap request"""
+    """Create a swap request.
+    Flow:
+    - New request is created with status 'pending_agent' (waiting for target agent decision).
+    - When target agent accepts, status becomes 'pending_admin'.
+    - Admin can then approve, which applies the actual roster swap.
+    """
     if is_killswitch_enabled():
         st.error("System is currently locked. Please contact the developer.")
         return False
@@ -1716,15 +1724,16 @@ def create_swap_request(requester_id, target_id, date, reason, requester_date=No
         # Insert with cross-date columns if available
         cursor.execute("PRAGMA table_info(swap_requests)")
         cols = [row[1] for row in cursor.fetchall()]
+        # Ensure we always start in an explicit agent-pending state
         if "requester_date" in cols and "target_date" in cols:
             cursor.execute('''
-                INSERT INTO swap_requests (requester_id, target_id, date, requester_date, target_date, reason)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO swap_requests (requester_id, target_id, date, requester_date, target_date, reason, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending_agent')
             ''', (requester_id, target_id, t_date, r_date, t_date, reason))
         else:
             cursor.execute('''
-                INSERT INTO swap_requests (requester_id, target_id, date, reason)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO swap_requests (requester_id, target_id, date, reason, status)
+                VALUES (?, ?, ?, ?, 'pending_agent')
             ''', (requester_id, target_id, t_date, reason))
         conn.commit()
         return True
@@ -1734,7 +1743,7 @@ def create_swap_request(requester_id, target_id, date, reason, requester_date=No
     finally:
         conn.close()
 
-def get_swap_requests(status='pending'):
+def get_swap_requests(status='pending_agent'):
     """Get swap requests by status in a stable column order."""
     conn = sqlite3.connect("data/requests.db")
     try:
@@ -1766,14 +1775,71 @@ def get_swap_requests(status='pending'):
     finally:
         conn.close()
 
-def approve_swap_request(swap_id, approved_by):
-    """Approve a swap request"""
+def respond_to_swap_request_as_agent(swap_id, acting_agent_id, accept):
+    """Handle the target agent's decision on a swap request.
+    - Only the target agent can respond.
+    - If accept=True and current status is 'pending_agent', move to 'pending_admin'.
+    - If accept=False, mark as 'rejected'.
+    """
     if is_killswitch_enabled():
         st.error("System is currently locked. Please contact the developer.")
         return False
     conn = sqlite3.connect("data/requests.db")
     try:
         cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, requester_id, target_id, status
+            FROM swap_requests
+            WHERE id = ?
+        ''', (swap_id,))
+        row = cursor.fetchone()
+        if not row:
+            st.error("Swap request not found.")
+            return False
+        _, requester_id, target_id, status = row
+        # Ensure only the target agent can act at this step
+        if str(target_id) != str(acting_agent_id):
+            st.error("You are not allowed to respond to this swap request.")
+            return False
+        if status != 'pending_agent':
+            st.error("This swap request is no longer awaiting agent approval.")
+            return False
+        new_status = 'pending_admin' if accept else 'rejected'
+        cursor.execute('''
+            UPDATE swap_requests
+            SET status = ?, approved_at = CASE WHEN ? = 'rejected' THEN CURRENT_TIMESTAMP ELSE approved_at END
+            WHERE id = ?
+        ''', (new_status, new_status, swap_id))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def approve_swap_request(swap_id, approved_by):
+    """Approve a swap request as an admin.
+    This should be called only after the target agent has accepted,
+    i.e. when status is 'pending_admin'. On success, status becomes
+    'approved' and the actual roster swap is applied.
+    """
+    if is_killswitch_enabled():
+        st.error("System is currently locked. Please contact the developer.")
+        return False
+    conn = sqlite3.connect("data/requests.db")
+    try:
+        cursor = conn.cursor()
+        # Load current status to ensure we only approve when waiting for admin
+        cursor.execute('''
+            SELECT status FROM swap_requests WHERE id = ?
+        ''', (swap_id,))
+        row = cursor.fetchone()
+        if not row:
+            st.error("Swap request not found.")
+            return False
+        current_status = row[0]
+        if current_status != 'pending_admin':
+            st.error("Swap request must be accepted by the agent before admin approval.")
+            return False
+
         swap_row = get_swap_by_id(swap_id)
         cursor.execute('''
             UPDATE swap_requests 
@@ -1946,10 +2012,59 @@ def add_late_login(agent_name, presence_time, login_time, reason):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+        # Ensure migration for late_logins approval fields
+        try:
+            cursor.execute("PRAGMA table_info(late_logins)")
+            cols = [row[1] for row in cursor.fetchall()]
+            if "status" not in cols:
+                cursor.execute("ALTER TABLE late_logins ADD COLUMN status TEXT DEFAULT 'pending'")
+            if "approved_by" not in cols:
+                cursor.execute("ALTER TABLE late_logins ADD COLUMN approved_by TEXT")
+            if "approved_at" not in cols:
+                cursor.execute("ALTER TABLE late_logins ADD COLUMN approved_at TEXT")
+        except Exception:
+            pass
+
         cursor.execute("""
-            INSERT INTO late_logins (agent_name, presence_time, login_time, reason, timestamp) 
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO late_logins (agent_name, presence_time, login_time, reason, timestamp, status) 
+            VALUES (?, ?, ?, ?, ?, 'pending')
         """, (agent_name, presence_time, login_time, reason, get_casablanca_time()))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def approve_late_login(entry_id, admin_username):
+    """Mark a late login as approved by an admin."""
+    if is_killswitch_enabled():
+        st.error("System is currently locked. Please contact the developer.")
+        return False
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE late_logins
+            SET status = 'approved', approved_by = ?, approved_at = ?
+            WHERE id = ?
+        """, (admin_username, get_casablanca_time(), entry_id))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+def reject_late_login(entry_id, admin_username):
+    """Mark a late login as rejected by an admin."""
+    if is_killswitch_enabled():
+        st.error("System is currently locked. Please contact the developer.")
+        return False
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE late_logins
+            SET status = 'rejected', approved_by = ?, approved_at = ?
+            WHERE id = ?
+        """, (admin_username, get_casablanca_time(), entry_id))
         conn.commit()
         return True
     finally:
@@ -3242,9 +3357,11 @@ def wfm_admin_dashboard():
     # Swap Requests Management
     st.markdown("---")
     st.subheader("🔄 Swap Requests Management")
-    tab1, tab2, tab3 = st.tabs(["Pending","Approved","Rejected"])
+    tab1, tab2, tab3 = st.tabs(["Pending Admin Approval","Approved","Rejected"])
     with tab1:
-        pending_swaps = get_swap_requests('pending')
+        # In the admin view, we only show swaps that are already accepted by the target
+        # agent and are now waiting for admin action.
+        pending_swaps = get_swap_requests('pending_admin')
         if pending_swaps:
             for swap in pending_swaps:
                 req = get_agent_by_id(swap[1]); tgt = get_agent_by_id(swap[2])
@@ -3268,7 +3385,7 @@ def wfm_admin_dashboard():
                                 st.success("Swap request rejected!")
                                 st.rerun()
         else:
-            st.info("No pending swap requests")
+            st.info("No swap requests are currently waiting for admin approval")
     with tab2:
         approved_swaps = get_swap_requests('approved')
         if approved_swaps:
@@ -3425,7 +3542,7 @@ def wfm_agent_dashboard():
                     if st.button("Submit Swap Request"):
                         if reason.strip():
                             try:
-                                create_swap_request(
+                                ok = create_swap_request(
                                     current_agent_id,
                                     selected_agent_id,
                                     (their_take_date.strftime('%Y-%m-%d') if hasattr(their_take_date, 'strftime') else str(their_take_date)),
@@ -3433,8 +3550,12 @@ def wfm_agent_dashboard():
                                     requester_date=(my_give_date.strftime('%Y-%m-%d') if hasattr(my_give_date, 'strftime') else str(my_give_date)),
                                     target_date=(their_take_date.strftime('%Y-%m-%d') if hasattr(their_take_date, 'strftime') else str(their_take_date))
                                 )
-                                st.success("Swap request submitted successfully!")
-                                st.rerun()
+                                if ok:
+                                    st.success("Swap request submitted successfully!")
+                                    st.rerun()
+                                else:
+                                    # create_swap_request already showed a specific error
+                                    st.warning("Swap request could not be created. Please review the errors above.")
                             except Exception as e:
                                 st.error(f"Failed to submit swap request: {str(e)}")
                         else:
@@ -3444,7 +3565,8 @@ def wfm_agent_dashboard():
         
         # Incoming requests for me (approve/reject as target)
         st.subheader("Incoming Swap Requests")
-        incoming = [s for s in get_swap_requests('pending') if s[2] == current_agent_id]
+        # Only show requests that are waiting for the target agent decision
+        incoming = [s for s in get_swap_requests('pending_agent') if s[2] == current_agent_id]
         if incoming:
             for swap in incoming:
                 requester_name = swap[11] or swap[1]
@@ -3455,23 +3577,23 @@ def wfm_agent_dashboard():
                     st.write(f"**Reason:** {swap[7] or ''}")
                     cols = st.columns(2)
                     with cols[0]:
-                        if st.button("✅ Approve", key=f"agent_approve_{swap[0]}"):
-                            if approve_swap_request(swap[0], st.session_state.username):
-                                st.success("Approved and applied")
+                        if st.button("✅ Accept", key=f"agent_accept_{swap[0]}"):
+                            if respond_to_swap_request_as_agent(swap[0], current_agent_id, True):
+                                st.success("You accepted this swap. It is now waiting for admin approval.")
                                 st.rerun()
                     with cols[1]:
                         if st.button("❌ Reject", key=f"agent_reject_{swap[0]}"):
-                            if reject_swap_request(swap[0], st.session_state.username):
-                                st.success("Rejected")
+                            if respond_to_swap_request_as_agent(swap[0], current_agent_id, False):
+                                st.success("You rejected this swap request.")
                                 st.rerun()
         else:
             st.info("No incoming requests")
 
         # Show agent's swap requests
         st.subheader("Your Swap Requests")
-        # Show all swaps (pending/approved/rejected) where you are requester or target
+        # Show all swaps (any status) where you are requester or target
         my_swaps = []
-        for status in ['pending', 'approved', 'rejected']:
+        for status in ['pending_agent', 'pending_admin', 'approved', 'rejected']:
             my_swaps.extend(get_swap_requests(status))
         my_swaps = [s for s in my_swaps if s[1] == current_agent_id or s[2] == current_agent_id]
         
@@ -3494,8 +3616,8 @@ def wfm_agent_dashboard():
                         st.write(f"**Approved by:** {swap[9]}")
                         st.write(f"**Approved at:** {swap[10]}")
                     
-                    # Allow cancellation of own pending requests
-                    if swap[1] == current_agent_id and (swap[6] or '') == 'pending':
+                    # Allow cancellation of own agent-pending requests
+                    if swap[1] == current_agent_id and (swap[6] or '') == 'pending_agent':
                         if st.button(f"Cancel Request", key=f"wfm_cancel_{swap[0]}"):
                             try:
                                 if reject_swap_request(swap[0], st.session_state.username):
@@ -4792,6 +4914,144 @@ else:
                 """, unsafe_allow_html=True)
         else:
             st.error("System is currently locked. Access to mistakes is disabled.")
+
+    elif st.session_state.current_section == "late_login":
+        if not is_killswitch_enabled():
+            # Agent submission form (existing behavior)
+            if st.session_state.role in ["agent", "admin"]:
+                with st.expander("➕ Submit Late Login", expanded=False):
+                    with st.form("late_login_form"):
+                        # Agent name is fixed to the logged-in user; they cannot change it.
+                        st.markdown(f"**Agent Name:** {st.session_state.username}")
+                        agent_name = st.session_state.username
+                        # Use free-text inputs for time so agents can enter any format they use operationally
+                        presence_time = st.text_input("Presence Time (e.g. 09:00)")
+                        login_time = st.text_input("Login Time (e.g. 09:15)")
+
+                        # Use dropdown options for late_login reasons
+                        late_reason_choices = get_dropdown_options("late_login") or []
+                        reason_choices = ["Select a reason..."] + late_reason_choices
+                        reason_choice = st.selectbox(
+                            "Reason for late login",
+                            reason_choices,
+                            index=0
+                        )
+                        extra_note = st.text_input("Additional details (optional)")
+
+                        if st.form_submit_button("Submit Late Login"):
+                            if agent_name and presence_time and login_time and reason_choice != "Select a reason...":
+                                reason_value = reason_choice
+                                if extra_note.strip():
+                                    reason_value = f"{reason_choice} - {extra_note.strip()}"
+                                if add_late_login(agent_name, presence_time, login_time, reason_value):
+                                    st.success("Late login submitted and pending approval.")
+                                    st.rerun()
+                            else:
+                                st.error("Please fill all fields and select a reason.")
+
+            st.subheader("Late Login Entries")
+
+            # Load all late logins once
+            all_late_rows = get_late_logins()
+
+            # Admins: keep search + date filters and see all entries
+            if st.session_state.role == "admin":
+                col_f1, col_f2, col_f3 = st.columns(3)
+                with col_f1:
+                    late_search = st.text_input("Search (agent / reason)")
+                with col_f2:
+                    late_start_date = st.date_input("From date", value=None)
+                with col_f3:
+                    late_end_date = st.date_input("To date", value=None)
+
+                filtered_rows = []
+                for row in all_late_rows:
+                    # id, agent_name, presence_time, login_time, reason, timestamp, status, approved_by, approved_at
+                    agent_name_f   = row[1]
+                    reason_f       = row[4]
+                    submitted_at_f = row[5]
+
+                    # Text search on agent or reason
+                    if late_search:
+                        s = late_search.lower()
+                        if s not in str(agent_name_f).lower() and s not in str(reason_f).lower():
+                            continue
+
+                    # Date interval filter based on submitted_at
+                    if late_start_date or late_end_date:
+                        dt = convert_to_casablanca_date(submitted_at_f)
+                        if dt:
+                            if late_start_date and dt < late_start_date:
+                                continue
+                            if late_end_date and dt > late_end_date:
+                                continue
+
+                    filtered_rows.append(row)
+
+                late_rows = filtered_rows
+            else:
+                # Agents: no search/date filters; only see their own late logins
+                late_rows = [row for row in all_late_rows if str(row[1]).lower() == str(st.session_state.username).lower()]
+
+            if not late_rows:
+                st.info("No late login entries match your filters.")
+            else:
+                for row in late_rows:
+                    # Expected order from SELECT *: id, agent_name, presence_time, login_time,
+                    # reason, timestamp, status, approved_by, approved_at
+                    entry_id     = row[0]
+                    agent_name   = row[1]
+                    presence     = row[2]
+                    login_t      = row[3]
+                    reason       = row[4]
+                    submitted_at = row[5]
+                    status       = row[6] if len(row) > 6 and row[6] else "pending"
+                    approved_by  = row[7] if len(row) > 7 else None
+                    approved_at  = row[8] if len(row) > 8 else None
+
+                    header = f"{agent_name} | {presence} → {login_t} | {status.upper()}"
+                    with st.expander(header):
+                        st.write(f"**Agent:** {agent_name}")
+                        st.write(f"**Presence time:** {presence}")
+                        st.write(f"**Login time:** {login_t}")
+                        st.write(f"**Reason:** {reason}")
+                        st.write(f"**Submitted at:** {submitted_at}")
+                        st.write(f"**Status:** {status.upper()}")
+                        if approved_by:
+                            st.write(f"**Approved/Rejected by:** {approved_by}")
+                        if approved_at:
+                            st.write(f"**Approved/Rejected at:** {approved_at}")
+
+                        # Only admins can approve/reject, and only while pending
+                        if st.session_state.role == "admin" and status == "pending":
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                if st.button("✅ Approve", key=f"late_approve_{entry_id}"):
+                                    if approve_late_login(entry_id, st.session_state.username):
+                                        st.success("Late login approved.")
+                                        st.rerun()
+                            with c2:
+                                if st.button("❌ Reject", key=f"late_reject_{entry_id}"):
+                                    if reject_late_login(entry_id, st.session_state.username):
+                                        st.success("Late login rejected.")
+                                        st.rerun()
+
+                # Optional: simple export button including approval info
+                if st.session_state.role == "admin":
+                    import pandas as pd
+                    df = pd.DataFrame(late_rows, columns=[
+                        "ID", "Agent Name", "Presence Time", "Login Time",
+                        "Reason", "Submitted At", "Status", "Approved By", "Approved At"
+                    ])
+                    csv = df.to_csv(index=False).encode('utf-8')
+                    st.download_button(
+                        "Download Late Logins as CSV",
+                        csv,
+                        "late_logins.csv",
+                        "text/csv"
+                    )
+        else:
+            st.error("System is currently locked. Access to late login is disabled.")
 
     elif st.session_state.current_section == "chat":
         if not is_killswitch_enabled():
