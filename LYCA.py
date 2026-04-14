@@ -1132,14 +1132,35 @@ def bulk_update_template_times(hours):
         return False
 
 def save_break_data():
-    with open('templates.json', 'w') as f:
-        json.dump(st.session_state.templates, f)
-    with open('break_limits.json', 'w') as f:
-        json.dump(st.session_state.break_limits, f)
-    with open('all_bookings.json', 'w') as f:
-        json.dump(st.session_state.agent_bookings, f)
-    with open('active_templates.json', 'w') as f:
-        json.dump(st.session_state.active_templates, f)
+    """Persist break-related data atomically and return True on success."""
+    try:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        os.makedirs(current_dir, exist_ok=True)
+
+        temp_files = []
+        def write_tmp(filename, data):
+            tmp_path = os.path.join(current_dir, filename + '.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            temp_files.append((tmp_path, os.path.join(current_dir, filename)))
+
+        # Queue writes
+        write_tmp('all_bookings.json', st.session_state.agent_bookings)
+        write_tmp('templates.json', st.session_state.get('templates', {}))
+        write_tmp('break_limits.json', st.session_state.get('break_limits', {}))
+        write_tmp('active_templates.json', st.session_state.get('active_templates', []))
+
+        # Atomic replace
+        for tmp_path, final_path in temp_files:
+            os.replace(tmp_path, final_path)
+
+        return True
+    except Exception as e:
+        try:
+            st.error(f"Error saving break data: {str(e)}")
+        except Exception:
+            pass
+        return False
 
 def adjust_time(time_str, offset):
     try:
@@ -2968,31 +2989,113 @@ else:
                         import streamlit.components.v1 as components
                         js_break = f"""
                         <script>
-                        const breakTimes = {json.dumps(break_times)};
-                        const serverTimeISO = '{now_casa.isoformat()}';
-                        const keyPrefix = 'notified_break_sidebar_';
                         (function() {{
-                            const now = new Date(serverTimeISO);
-                            const today = now.toISOString().split('T')[0];
-                            breakTimes.forEach(bt => {{
-                                const [h,m] = bt.split(':');
-                                const bTime = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0);
-                                const diffMin = Math.floor((bTime - now) / 60000);
-                                const storageKey = keyPrefix + today + '_' + bt;
-                                if (diffMin >= 4 && diffMin < 5 && !localStorage.getItem(storageKey)) {{
-                                    const notify = () => new Notification('Break Reminder', {{ body: `Your break starts in 5 minutes at ${{bt}}.` }});
-                                    if (Notification.permission === 'granted') {{
-                                        notify();
-                                        localStorage.setItem(storageKey,'1');
-                                    }} else if (Notification.permission !== 'denied') {{
-                                        Notification.requestPermission().then(p => {{ if (p==='granted') {{ notify(); localStorage.setItem(storageKey,'1'); }} }});
-                                    }}
+                            const breakTimes = {json.dumps(break_times)};
+                            const serverTimeISO = '{now_casa.isoformat()}';
+                            const start = new Date(serverTimeISO);
+                            const dayKey = start.toISOString().split('T')[0];
+
+                            function buildBreakDate(hm, base) {{
+                                const parts = hm.split(':');
+                                const h = parseInt(parts[0], 10) || 0;
+                                const m = parseInt(parts[1], 10) || 0;
+                                return new Date(base.getFullYear(), base.getMonth(), base.getDate(), h, m, 0, 0);
+                            }}
+
+                            const breaks = breakTimes.map(function(bt) {{ return {{ bt: bt, time: buildBreakDate(bt, start) }}; }});
+
+                            function notifyOnce(key, title, body) {{
+                                if (localStorage.getItem(key)) return;
+                                function doNotify() {{
+                                    try {{ new Notification(title, {{ body: body }}); }} catch (e) {{}}
+                                    localStorage.setItem(key, '1');
                                 }}
-                            }});
+                                if (Notification.permission === 'granted') {{
+                                    doNotify();
+                                }} else if (Notification.permission !== 'denied') {{
+                                    Notification.requestPermission().then(function(p) {{ if (p === 'granted') doNotify(); }});
+                                }}
+                            }}
+
+                            function tick() {{
+                                const now = new Date();
+                                breaks.forEach(function(b) {{
+                                    const remainingSec = Math.floor((b.time - now) / 1000);
+                                    [['300','5 minutes'], ['60','1 minute'], ['0','now']].forEach(function(pair) {{
+                                        const target = parseInt(pair[0], 10);
+                                        const label = pair[1];
+                                        const key = 'notified_break_' + dayKey + '_' + b.bt + '_' + target;
+                                        if (remainingSec === target) {{
+                                            const body = (label === 'now') ? ('Your break starts now at ' + b.bt + '.') : ('Your break starts in ' + label + ' at ' + b.bt + '.');
+                                            notifyOnce(key, 'Break Reminder', body);
+                                        }}
+                                    }});
+                                }});
+                            }}
+                            tick();
+                            setInterval(tick, 1000);
                         }})();
                         </script>
                         """
                         components.html(js_break, height=0)
+
+                        # Live countdown to next break (client-side updates every second)
+                        next_break_timer = f"""
+                        <div id=\"next-break-container\" style=\"background: {'#1e293b' if st.session_state.color_mode == 'dark' else '#ffffff'}; border: 1px solid {'#334155' if st.session_state.color_mode == 'dark' else '#e2e8f0'}; padding: 0.75rem; border-radius: 0.5rem; margin-top: 0.75rem;\">
+                            <div style=\"color: {'#e2e8f0' if st.session_state.color_mode == 'dark' else '#1e293b'}; font-weight: 600; margin-bottom: 0.25rem;\">Next Break</div>
+                            <div id=\"next-break-label\" style=\"color: {'#94a3b8' if st.session_state.color_mode == 'dark' else '#475569'};\">Calculating…</div>
+                            <div id=\"next-break-countdown\" style=\"font-size: 1.1rem; font-weight: 700; color: {'#e2e8f0' if st.session_state.color_mode == 'dark' else '#1f2937'};\">--:--:--</div>
+                        </div>
+                        <script>
+                        (function() {{
+                            const breakTimes = {json.dumps(break_times)}; // ["HH:MM", ...]
+                            const serverTimeISO = '{now_casa.isoformat()}';
+                            const labelEl = document.getElementById('next-break-label');
+                            const countdownEl = document.getElementById('next-break-countdown');
+
+                            function parseHM(hm) {{
+                                const [h, m] = hm.split(':').map(Number);
+                                const base = new Date(serverTimeISO);
+                                return new Date(base.getFullYear(), base.getMonth(), base.getDate(), h, m, 0, 0);
+                            }}
+
+                            function getNextBreak(now) {{
+                                const candidates = breakTimes.map(parseHM).filter(d => d.getTime() >= now.getTime());
+                                if (candidates.length === 0) return null;
+                                candidates.sort((a,b) => a - b);
+                                return candidates[0];
+                            }}
+
+                            let now = new Date(serverTimeISO);
+                            let nextBreak = getNextBreak(now);
+
+                            function fmt2(n) {{ return String(n).padStart(2, '0'); }}
+                            function render() {{
+                                now = new Date(now.getTime() + 1000); // tick locally
+                                if (!nextBreak || now > nextBreak) {{
+                                    nextBreak = getNextBreak(now);
+                                }}
+                                if (!nextBreak) {{
+                                    labelEl.textContent = 'No more breaks today';
+                                    countdownEl.textContent = '--:--:--';
+                                    return;
+                                }}
+                                const hh = fmt2(nextBreak.getHours());
+                                const mm = fmt2(nextBreak.getMinutes());
+                                labelEl.textContent = 'Starts at ' + hh + ':' + mm;
+                                const diffMs = Math.max(0, nextBreak - now);
+                                const s = Math.floor(diffMs / 1000);
+                                const h = Math.floor(s / 3600);
+                                const m = Math.floor((s % 3600) / 60);
+                                const sec = s % 60;
+                                countdownEl.textContent = fmt2(h) + ':' + fmt2(m) + ':' + fmt2(sec);
+                            }}
+                            render();
+                            setInterval(render, 1000);
+                        }})();
+                        </script>
+                        """
+                        components.html(next_break_timer, height=110)
 
             # --- Auto-update & browser notification for admin when new request is added ---
             if st.session_state.role == "admin":
@@ -3203,6 +3306,12 @@ else:
 
     elif st.session_state.current_section == "chat":
         if not is_killswitch_enabled():
+            # Auto-refresh chat section periodically to fetch new messages without manual reload
+            try:
+                from streamlit_autorefresh import st_autorefresh  # type: ignore
+                st_autorefresh(interval=3000, key="chat_autorefresh")
+            except ImportError:
+                pass
             # Add notification permission request
             st.markdown("""
             <div id="notification-container"></div>
@@ -3234,21 +3343,18 @@ else:
             if is_chat_killswitch_enabled():
                 st.warning("Chat functionality is currently disabled by the administrator.")
             else:
-                # Lightweight auto-refresh so new messages appear without manual reload
-                try:
-                    from streamlit_autorefresh import st_autorefresh  # type: ignore
-                    st_autorefresh(
-                        interval=5000,
-                        key=f"chat_autorefresh_{st.session_state.username}"
-                    )
-                except ImportError:
-                    pass
-
                 # Group chat group selection
                 group_filter = None
                 if st.session_state.role == "admin":
                     all_groups = list(set([u[3] for u in get_all_users() if u[3]]))
-                    group_filter = st.selectbox("Select Group to View Chat", all_groups, key="admin_chat_group")
+                    if all_groups:
+                        # Preselect the first available group to avoid None state
+                        default_index = 0
+                        group_filter = st.selectbox("Select Group to View Chat", all_groups, index=default_index, key="admin_chat_group")
+                    else:
+                        st.info("No groups available. Create or assign a group to start chatting.")
+                        all_groups = []
+                        group_filter = None
                 else:
                     # Always look up the user's group from the users table each time
                     user_group = None
@@ -3340,11 +3446,11 @@ else:
                                         if u[1] == st.session_state.username:
                                             send_to_group = u[3]
                                             break
-                                if send_to_group:
-                                    send_group_message(st.session_state.username, message, send_to_group)
+                                if send_to_group and str(send_to_group).strip() != "":
+                                    if send_group_message(st.session_state.username, message, send_to_group):
+                                        st.rerun()
                                 else:
                                     st.warning("No group selected for chat.")
-                                st.rerun()
         else:
             st.error("System is currently locked. Access to chat is disabled.")
 
